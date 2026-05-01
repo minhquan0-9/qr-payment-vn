@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Demo - Tạo đơn hàng</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; max-width: 480px; margin: 40px auto; padding: 0 16px; }
+  h1 { font-size: 1.5rem; }
+  form { display: grid; gap: 12px; }
+  label { display: grid; gap: 4px; font-size: 0.9rem; }
+  input, button { font: inherit; padding: 10px 12px; border-radius: 8px; border: 1px solid #888; background: transparent; color: inherit; }
+  button { background: #2563eb; color: white; border: none; cursor: pointer; }
+  button:hover { background: #1d4ed8; }
+  .hint { font-size: 0.85rem; opacity: 0.75; }
+</style>
+</head>
+<body>
+  <h1>Tạo đơn thanh toán</h1>
+  <p class="hint">Demo cho hệ thống tự động xác nhận thanh toán qua biến động số dư SMS.</p>
+  <form id="form">
+    <label>
+      Số tiền (VND)
+      <input type="number" name="amount" min="1000" step="1000" value="10000" required>
+    </label>
+    <label>
+      Mô tả đơn (tuỳ chọn)
+      <input type="text" name="description" placeholder="Ví dụ: Áo thun size L">
+    </label>
+    <button type="submit">Tạo đơn &amp; sinh QR</button>
+  </form>
+
+<script>
+document.getElementById('form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const fd = new FormData(e.target);
+  const body = {
+    amount: parseInt(fd.get('amount'), 10),
+    description: fd.get('description') || null,
+  };
+  const res = await fetch('/api/orders', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    alert('Tạo đơn thất bại: ' + await res.text());
+    return;
+  }
+  const order = await res.json();
+  location.href = '/checkout/' + order.order_code;
+});
+</script>
+</body>
+</html>
