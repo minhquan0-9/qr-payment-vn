@@ -1,21 +1,24 @@
-"""Entry point cho container worker (poll MB Bank).
+"""Entry point cho container worker.
 
-Chạy độc lập với FastAPI app:
-    python -m app.worker
+Chạy:
+    BANK_TYPE=mb  python -m app.worker
+    BANK_TYPE=acb python -m app.worker
+    BANK_TYPE=tpb python -m app.worker
 
-Đọc config từ env (DATABASE_URL, MB_USERNAME, MB_PASSWORD, ...). Tự tạo bảng DB
-nếu dùng SQLite; với Postgres giả định Alembic đã migrate.
+Mỗi container 1 worker / 1 NH. Tất cả worker đẩy giao dịch vào cùng DB và
+publish event lên cùng event bus → web bán hàng nhận realtime "paid"
+bất kể tiền vào từ NH nào.
 """
-
 from __future__ import annotations
 
 import asyncio
 import logging
 import signal
+import sys
 
 from app.config import get_settings
 from app.database import init_db
-from app.services.banking import MBBankClient
+from app.services.banking import build_client_from_settings
 from app.services.poller import BankPoller
 
 logging.basicConfig(
@@ -30,15 +33,12 @@ async def main() -> None:
     if settings.database_url.startswith("sqlite"):
         await init_db()
 
-    if not settings.mb_username or not settings.mb_password:
-        logger.error("MB_USERNAME / MB_PASSWORD chưa được cấu hình; worker exit.")
-        return
+    try:
+        client = build_client_from_settings(settings)
+    except ValueError as exc:
+        logger.error("Worker config error: %s", exc)
+        sys.exit(1)
 
-    client = MBBankClient(
-        username=settings.mb_username,
-        password=settings.mb_password,
-        account_no=settings.mb_account_no,
-    )
     poller = BankPoller(
         client=client,
         interval_seconds=settings.poll_interval_seconds,
@@ -50,9 +50,9 @@ async def main() -> None:
         try:
             loop.add_signal_handler(sig, lambda: asyncio.create_task(poller.stop()))
         except NotImplementedError:
-            # Windows / non-main thread không hỗ trợ
             pass
 
+    logger.info("Worker started: bank_type=%s", settings.bank_type)
     await poller.run_forever()
 
 

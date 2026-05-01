@@ -30,8 +30,15 @@ services:
              uvicorn app.main:app --host 0.0.0.0 --port 8000 --proxy-headers"
     restart: unless-stopped
 
-  worker:
+  # ===== Worker per-bank =====
+  # Bật bằng profile, ví dụ:
+  #   docker compose --profile mb up
+  #   docker compose --profile mb --profile acb up
+  #   docker compose --profile mb --profile acb --profile tpb up
+
+  worker-mb:
     build: .
+    profiles: ["mb", "all"]
     depends_on:
       postgres:
         condition: service_healthy
@@ -40,6 +47,37 @@ services:
     env_file: .env
     environment:
       DATABASE_URL: postgresql+asyncpg://payment:payment@postgres:5432/payments
+      BANK_TYPE: mb
+    command: ["python", "-m", "app.worker"]
+    restart: unless-stopped
+
+  worker-acb:
+    build: .
+    profiles: ["acb", "all"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      app:
+        condition: service_started
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://payment:payment@postgres:5432/payments
+      BANK_TYPE: acb
+    command: ["python", "-m", "app.worker"]
+    restart: unless-stopped
+
+  worker-tpb:
+    build: .
+    profiles: ["tpb", "all"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      app:
+        condition: service_started
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://payment:payment@postgres:5432/payments
+      BANK_TYPE: tpb
     command: ["python", "-m", "app.worker"]
     restart: unless-stopped
 

@@ -48,8 +48,11 @@ async def test_bank_health_endpoint(app):
         r = await client.get("/api/bank/health")
         assert r.status_code == 200
         body = r.json()
-        assert "mb_username_configured" in body
+        assert "bank_type" in body
         assert "poll_interval_seconds" in body
+        assert "mb" in body and "username_configured" in body["mb"]
+        assert "acb" in body
+        assert "tpb" in body
 
 
 @pytest.mark.asyncio

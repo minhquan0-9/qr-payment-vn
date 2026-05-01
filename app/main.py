@@ -28,22 +28,21 @@ async def lifespan(app: FastAPI):
         await init_db()
 
     poller_task: asyncio.Task | None = None
-    if settings.enable_in_process_poller and settings.mb_username and settings.mb_password:
-        from app.services.banking import MBBankClient
+    if settings.enable_in_process_poller:
+        from app.services.banking import build_client_from_settings
         from app.services.poller import BankPoller
 
-        client = MBBankClient(
-            username=settings.mb_username,
-            password=settings.mb_password,
-            account_no=settings.mb_account_no,
-        )
-        poller = BankPoller(
-            client=client,
-            interval_seconds=settings.poll_interval_seconds,
-            lookback_minutes=settings.poll_lookback_minutes,
-        )
-        poller_task = asyncio.create_task(poller.run_forever())
-        logger.info("In-process MB poller started")
+        try:
+            client = build_client_from_settings(settings)
+            poller = BankPoller(
+                client=client,
+                interval_seconds=settings.poll_interval_seconds,
+                lookback_minutes=settings.poll_lookback_minutes,
+            )
+            poller_task = asyncio.create_task(poller.run_forever())
+            logger.info("In-process poller started: bank_type=%s", settings.bank_type)
+        except ValueError as exc:
+            logger.warning("In-process poller disabled: %s", exc)
 
     try:
         yield

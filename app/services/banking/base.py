@@ -40,6 +40,18 @@ class BankClient(ABC):
         """Trả về các giao dịch tiền vào trong [since, until]."""
         ...
 
+    async def verify_login(self) -> dict:
+        """Login + lấy 1 thông tin nhỏ để xác thực credentials.
+
+        Raise exception nếu login fail. Trả về dict tóm tắt (ví dụ
+        ``{"accounts": [...]}``) nếu OK. Subclass có thể override; mặc định
+        gọi ``fetch_incoming_transactions`` với cửa sổ 0 phút.
+        """
+        from datetime import datetime
+        now = datetime.now()
+        await self.fetch_incoming_transactions(since=now, until=now)
+        return {"ok": True}
+
     async def aclose(self) -> None:
         """Hook cleanup nếu adapter có session/connection cần đóng."""
         return None

@@ -61,7 +61,7 @@ class MBBankClient(BankClient):
         self._client = MBBankAsync(username=username, password=password)
         self._discovered_accounts: list[str] = []
 
-    async def _accounts_to_query(self) -> list[str]:
+    async def _accounts_to_query(self, *, raise_on_error: bool = False) -> list[str]:
         if self._account_no:
             return [self._account_no]
         if self._discovered_accounts:
@@ -69,6 +69,8 @@ class MBBankClient(BankClient):
         try:
             balance = await self._client.getBalance()
         except Exception:
+            if raise_on_error:
+                raise
             logger.exception("MB getBalance() failed")
             return []
         accts: list[str] = []
@@ -80,6 +82,10 @@ class MBBankClient(BankClient):
         if accts:
             logger.info("MB discovered accounts: %s", accts)
         return accts
+
+    async def verify_login(self) -> dict:
+        accts = await self._accounts_to_query(raise_on_error=True)
+        return {"ok": True, "accounts": accts}
 
     async def fetch_incoming_transactions(
         self, *, since: datetime, until: datetime
