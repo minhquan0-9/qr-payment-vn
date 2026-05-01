@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -9,7 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from app.api import orders, webhooks
+from app.api import bank, orders, webhooks
 from app.config import get_settings
 from app.database import init_db
 
@@ -17,23 +18,54 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s - %(message)s",
 )
+logger = logging.getLogger("payment.app")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = get_settings()
     if settings.database_url.startswith("sqlite"):
-        # Tự tạo bảng cho dev. Postgres dùng Alembic.
         await init_db()
-    yield
+
+    poller_task: asyncio.Task | None = None
+    if settings.enable_in_process_poller and settings.mb_username and settings.mb_password:
+        from app.services.banking import MBBankClient
+        from app.services.poller import BankPoller
+
+        client = MBBankClient(
+            username=settings.mb_username,
+            password=settings.mb_password,
+            account_no=settings.mb_account_no,
+        )
+        poller = BankPoller(
+            client=client,
+            interval_seconds=settings.poll_interval_seconds,
+            lookback_minutes=settings.poll_lookback_minutes,
+        )
+        poller_task = asyncio.create_task(poller.run_forever())
+        logger.info("In-process MB poller started")
+
+    try:
+        yield
+    finally:
+        if poller_task is not None:
+            poller_task.cancel()
+            try:
+                await poller_task
+            except (asyncio.CancelledError, Exception):
+                pass
 
 
 def create_app() -> FastAPI:
     settings = get_settings()
     app = FastAPI(
         title="Payment QR Backend",
-        description="Tự động xác nhận thanh toán qua biến động số dư SMS từ ngân hàng VN.",
-        version="0.1.0",
+        description=(
+            "Backend tự động xác nhận thanh toán cho web bán hàng VN. "
+            "Nguồn dữ liệu chính: MB Bank private API (worker poll). "
+            "Tuỳ chọn fallback: webhook SMS từ Android forwarder."
+        ),
+        version="0.2.0",
         lifespan=lifespan,
     )
 
@@ -46,7 +78,9 @@ def create_app() -> FastAPI:
     )
 
     app.include_router(orders.router)
-    app.include_router(webhooks.router)
+    app.include_router(bank.router)
+    if settings.enable_sms_webhook:
+        app.include_router(webhooks.router)
 
     @app.get("/health")
     async def health() -> JSONResponse:

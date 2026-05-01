@@ -20,19 +20,28 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    env_file: .env
     environment:
       DATABASE_URL: postgresql+asyncpg://payment:payment@postgres:5432/payments
-      BANK_BIN: ${BANK_BIN:-YOUR_BANK_BIN}
-      BANK_ACCOUNT_NUMBER: ${BANK_ACCOUNT_NUMBER:-YOUR_ACCOUNT_NUMBER}
-      BANK_ACCOUNT_NAME: ${BANK_ACCOUNT_NAME:-YOUR_NAME}
-      BANK_CODE: ${BANK_CODE:-GENERIC}
-      WEBHOOK_SECRET: ${WEBHOOK_SECRET:-change_me_in_production}
-      CORS_ORIGINS: ${CORS_ORIGINS:-*}
     ports:
       - "8000:8000"
     command: >
       sh -c "alembic upgrade head &&
-             uvicorn app.main:app --host 0.0.0.0 --port 8000"
+             uvicorn app.main:app --host 0.0.0.0 --port 8000 --proxy-headers"
+    restart: unless-stopped
+
+  worker:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+      app:
+        condition: service_started
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://payment:payment@postgres:5432/payments
+    command: ["python", "-m", "app.worker"]
+    restart: unless-stopped
 
 volumes:
   pgdata:

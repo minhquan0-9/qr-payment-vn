@@ -1,63 +1,100 @@
 # Payment QR Backend
 
-Backend FastAPI tự động xác nhận thanh toán cho web bán hàng VN qua **biến động số dư SMS** từ ngân hàng — không cần đăng ký dịch vụ trung gian, không cần API ngân hàng doanh nghiệp.
+Backend FastAPI tự động xác nhận thanh toán cho web bán hàng VN bằng cách **đăng nhập tự động vào MB Bank** (private API) trong 1 worker container, **poll lịch sử giao dịch theo chu kỳ**, và bắn realtime event về web khi có giao dịch trùng `order_code`.
 
-## Cách hoạt động
+> **Cảnh báo**: lib MB Bank dùng (`mbbank-lib`) là *unofficial*. Việc tự động hoá đăng nhập app banking có thể vi phạm ToS của MB. Hãy dùng tài khoản MB riêng dành cho web bán hàng, không dùng tài khoản chính. Anh đã nắm rủi ro này.
+
+## Kiến trúc
 
 ```
-[Web bán hàng]
-    │ POST /api/orders {amount, description}
-    │   ← {order_code, qr_url, status:"pending", expires_at}
-    │ GET  /api/orders/{code}/stream   (SSE realtime)
-    ▼
-[FastAPI backend]  ← POST /webhooks/sms ← [Android phone forwarder]
-    │                                       (nhận SMS biến động, forward HTTP)
-    ▼
-[PostgreSQL: orders, bank_transactions]
+┌─────────────────────────────────────────────────────────────────────┐
+│ docker compose up                                                   │
+│                                                                     │
+│  ┌──────────────┐   ┌─────────────────────┐   ┌──────────────────┐  │
+│  │  postgres    │   │  app (FastAPI)      │   │  worker          │  │
+│  │  :5432       │◄──┤  /api/orders        │   │  (poll MB API)   │  │
+│  │              │   │  /api/orders/{code} │   │                  │  │
+│  │              │   │  /api/orders/{code}/│   │  every Ns:       │  │
+│  │              │   │     stream (SSE)    │   │   1) login MB    │  │
+│  │              │   │  /api/bank/health   │◄──┤   2) get tx hist │  │
+│  │              │   │  /api/bank/test-... │   │   3) match order │  │
+│  └──────────────┘   └─────────────────────┘   │   4) publish     │  │
+│         ▲                     ▲               │      "paid" evt  │  │
+│         │                     │               └──────────────────┘  │
+│         │                     │                       │             │
+│         │                     │   shared event bus    │             │
+│         └─────────────────────┴───────────────────────┘             │
+└─────────────────────────────────────────────────────────────────────┘
+                              ▲
+                              │ HTTPS
+                              │
+                       ┌──────┴──────┐
+                       │  Web bán    │
+                       │  hàng       │
+                       └─────────────┘
 ```
 
-1. Web bán hàng gọi `POST /api/orders` để tạo đơn → backend sinh `order_code` duy nhất + URL ảnh QR (chuẩn VietQR) chứa `order_code` ở phần nội dung CK.
-2. Khách quét QR, chuyển tiền với nội dung CK = `order_code`.
-3. Điện thoại Android (cắm sạc 24/7) nhận SMS biến động số dư từ ngân hàng → app forwarder POST nội dung SMS về `/webhooks/sms`.
-4. Backend parse SMS, tìm `order_code` + match số tiền → chuyển order sang `paid` + bắn SSE event về web bán hàng.
+**Flow 1 đơn hàng**:
+1. Web bán hàng `POST /api/orders {amount, description}` → backend sinh `order_code` 8-10 ký tự + URL ảnh QR (chuẩn VietQR) chứa `order_code` ở phần *Nội dung CK*.
+2. Khách scan QR + chuyển tiền với nội dung CK = `order_code`.
+3. Worker container (đang đăng nhập MB Bank) poll endpoint `getTransactionAccountHistory` mỗi N giây → thấy giao dịch mới có `creditAmount > 0` và `description` chứa `order_code` → khớp → cập nhật order = `paid`.
+4. Backend bắn SSE event `paid` về web bán hàng đang lắng nghe → web hiển thị "✓ Đã thanh toán" tức thời.
 
 ## Yêu cầu
 
-- Python 3.11+
-- PostgreSQL 14+ (dev có thể chạy SQLite)
-- 1 điện thoại Android có SIM nhận SMS từ ngân hàng + 1 app forwarder (xem [docs/android-sms-forwarder.md](docs/android-sms-forwarder.md))
+- Docker + Docker Compose (chạy production).
+- Python 3.11+ (chạy local dev không Docker).
+- 1 tài khoản **MB Bank cá nhân** (mở được app MB trên điện thoại thường, không phải MB Pro/MBBiz).
 
-## Cài đặt nhanh (dev với SQLite)
+## Cách chạy
+
+### Cách 1 — Docker Compose (khuyến nghị)
 
 ```bash
-# 1. Cài deps (khuyên dùng uv hoặc venv)
-python -m venv .venv && source .venv/bin/activate
-pip install -e ".[dev]"
-
-# 2. Sao .env.example -> .env và sửa thông tin tài khoản nhận tiền
+unzip payment-qr-backend.zip && cd payment-qr-backend
 cp .env.example .env
-# Mở .env, sửa BANK_BIN / BANK_ACCOUNT_NUMBER / BANK_ACCOUNT_NAME / WEBHOOK_SECRET
-
-# 3. Chạy server (lần đầu sẽ tự tạo bảng SQLite)
-uvicorn app.main:app --reload
-
-# 4. Mở http://localhost:8000 -> điền số tiền -> được chuyển sang trang QR
-```
-
-## Chạy với Postgres (production-like)
-
-```bash
-docker compose up -d postgres
-export DATABASE_URL=postgresql+asyncpg://payment:payment@localhost:5432/payments
-alembic upgrade head
-uvicorn app.main:app --reload
-```
-
-Hoặc chạy cả app + postgres bằng compose:
-
-```bash
+# Sửa .env: BANK_BIN, BANK_ACCOUNT_NUMBER, BANK_ACCOUNT_NAME, MB_USERNAME, MB_PASSWORD
 docker compose up --build
 ```
+
+3 container sẽ start:
+- `postgres`: DB lưu order + lịch sử transaction
+- `app`: FastAPI server cổng 8000
+- `worker`: poll MB Bank → match order
+
+Mở `http://localhost:8000` để dùng frontend demo, hoặc `http://localhost:8000/docs` để xem Swagger.
+
+### Cách 2 — Local dev (SQLite, không Docker)
+
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install -e ".[dev]"
+cp .env.example .env
+# Sửa .env theo nhu cầu, ví dụ:
+#   DATABASE_URL=sqlite+aiosqlite:///./payments.db
+#   ENABLE_IN_PROCESS_POLLER=true   # poll trong cùng FastAPI process
+
+uvicorn app.main:app --reload   # chạy app + poller (nếu bật flag) cùng 1 process
+```
+
+Hoặc chạy worker riêng ở terminal thứ 2:
+```bash
+python -m app.worker
+```
+
+## Verify MB credentials
+
+Sau khi setup, gọi để kiểm tra:
+
+```bash
+curl http://localhost:8000/api/bank/health
+# {"mb_username_configured": true, "mb_password_configured": true, ...}
+
+curl -X POST http://localhost:8000/api/bank/test-login
+# {"ok": true, "accounts": ["0123456789"], "recent_incoming_count": 0, "recent": []}
+```
+
+Nếu `test-login` lỗi 502 → check log container `app` (`docker compose logs app`) để biết MB trả về gì (sai password / captcha fail / MB block / ...).
 
 ## Endpoints
 
@@ -65,55 +102,17 @@ docker compose up --build
 |---|---|---|
 | POST | `/api/orders` | Tạo đơn, trả về `order_code` + `qr_url` |
 | GET | `/api/orders/{code}` | Lấy trạng thái đơn (poll fallback) |
-| GET | `/api/orders/{code}/stream` | SSE realtime: nhận event `paid`/`expired`/`canceled` |
+| GET | `/api/orders/{code}/stream` | **SSE realtime**: nhận event `paid`/`expired`/`canceled` |
 | POST | `/api/orders/{code}/cancel` | Huỷ đơn pending |
-| POST | `/webhooks/sms` | Endpoint cho Android forwarder (cần header `X-Webhook-Secret`) |
+| GET | `/api/bank/health` | Trạng thái config MB |
+| POST | `/api/bank/test-login` | Verify MB login + lấy 5p giao dịch gần nhất (debug, **đừng public**) |
 | GET | `/health` | Health check |
-| GET | `/docs` | Swagger UI auto-gen |
+| GET | `/docs` | Swagger UI |
 
-### Ví dụ tạo đơn
-
-```bash
-curl -X POST http://localhost:8000/api/orders \
-  -H 'Content-Type: application/json' \
-  -d '{"amount": 25000, "description": "Áo thun size L"}'
-```
-
-```json
-{
-  "order_code": "PAY3F7K2X9A",
-  "amount": 25000,
-  "description": "Áo thun size L",
-  "status": "pending",
-  "qr_url": "https://img.vietqr.io/image/970436-0123456789-compact2.png?amount=25000&addInfo=PAY3F7K2X9A&accountName=YOUR_NAME",
-  "created_at": "2025-01-01T00:00:00Z",
-  "expires_at": "2025-01-01T00:15:00Z",
-  "paid_at": null
-}
-```
-
-### Ví dụ giả lập 1 SMS biến động (dev/test)
-
-```bash
-curl -X POST http://localhost:8000/webhooks/sms \
-  -H 'Content-Type: application/json' \
-  -H 'X-Webhook-Secret: <your-WEBHOOK_SECRET>' \
-  -d '{
-    "message": "VCB 18/04 12:34 TK 0123 +25,000VND. SD: 100,000 VND. ND: PAY3F7K2X9A thanh toan",
-    "sender": "Vietcombank"
-  }'
-```
-
-## Setup Android SMS Forwarder
-
-Xem chi tiết [docs/android-sms-forwarder.md](docs/android-sms-forwarder.md).
-
-## Tích hợp vào web bán hàng
-
-Phía web bán hàng (bất kỳ framework nào):
+### Tích hợp web bán hàng
 
 ```js
-// 1. Khi user bấm "Thanh toán", gọi backend
+// 1. Tạo đơn
 const r = await fetch('https://your-backend/api/orders', {
   method: 'POST',
   headers: {'Content-Type': 'application/json'},
@@ -122,41 +121,69 @@ const r = await fetch('https://your-backend/api/orders', {
 const order = await r.json();
 
 // 2. Hiển thị QR
-document.querySelector('img#qr').src = order.qr_url;
+document.querySelector('#qr-img').src = order.qr_url;
 
 // 3. Lắng nghe realtime
 const es = new EventSource(`https://your-backend/api/orders/${order.order_code}/stream`);
-es.addEventListener('paid', () => {
-  alert('Đã thanh toán thành công!');
-  // gọi tiếp API tạo đơn nội bộ / chuyển trang...
+es.addEventListener('paid', (e) => {
+  alert('Đã thanh toán!');
+  // gọi tiếp logic confirm đơn của anh...
 });
 ```
 
-## Test
+## Tests
 
 ```bash
 pytest -q
 ```
 
 Bao phủ:
-- Parser SMS cho 9 NH VN phổ biến (VCB, MB, BIDV, VTB, ACB, TCB, TPB, STB, AGR) + format generic.
-- Matching engine: happy path, thiếu tiền (không match), trả dư (vẫn match), order hết hạn, content có dấu tiếng Việt + ký tự đặc biệt.
-- End-to-end qua HTTP: tạo đơn → webhook → kiểm tra đã chuyển paid; xác thực secret; idempotent.
+- `tests/test_parsers.py` — SMS parser cho 9 NH VN (cho đường fallback SMS, optional).
+- `tests/test_matcher.py` — matching engine: happy path, thiếu/dư tiền, hết hạn, content có dấu tiếng Việt.
+- `tests/test_mbbank_helpers.py` — parse `creditAmount` / `postingDate` từ format MB.
+- `tests/test_poller.py` — `BankPoller` với fake bank client: ingest, dedupe, không match, publish event.
+- `tests/test_api.py` — e2e qua HTTP: tạo đơn, OpenAPI, SMS webhook fallback.
 
-## Lint
+Tổng 36 tests pass.
 
-```bash
-ruff check .
-ruff format .
-```
+## Cấu hình quan trọng (`.env`)
 
-## Lưu ý bảo mật
+| Biến | Mô tả | Default |
+|---|---|---|
+| `BANK_BIN` | BIN của NH (970422 = MB) | `970422` |
+| `BANK_ACCOUNT_NUMBER` | STK nhận tiền | `YOUR_ACCOUNT_NUMBER` |
+| `BANK_ACCOUNT_NAME` | Tên chủ TK (in trên QR) | `YOUR_NAME` |
+| `MB_USERNAME` | Username/SĐT đăng nhập MB | rỗng |
+| `MB_PASSWORD` | Password MB | rỗng |
+| `MB_ACCOUNT_NO` | STK MB cần track. Rỗng = auto từ tài khoản đăng nhập | rỗng |
+| `POLL_INTERVAL_SECONDS` | Giây giữa mỗi lần poll. <5s dễ bị MB block | `10` |
+| `POLL_LOOKBACK_MINUTES` | Cửa sổ lùi quá khứ ở lần poll đầu (chống miss tx khi worker restart) | `30` |
+| `DATABASE_URL` | DSN SQLAlchemy | postgres trong compose |
+| `ENABLE_IN_PROCESS_POLLER` | Chạy poller bên trong FastAPI process (thay vì worker container riêng) | `false` |
+| `ENABLE_SMS_WEBHOOK` | Bật `/webhooks/sms` làm fallback (xem [docs/sms-fallback.md](docs/android-sms-forwarder.md)) | `false` |
+| `WEBHOOK_SECRET` | Secret cho `/webhooks/sms` (chỉ khi bật SMS) | placeholder |
+| `ORDER_EXPIRES_MINUTES` | TTL đơn pending | `15` |
+| `CORS_ORIGINS` | Comma-separated origins, `*` = all | `*` |
 
-- Bảo vệ `/webhooks/sms` bằng `WEBHOOK_SECRET`. Dùng giá trị random ≥ 32 ký tự.
-- KHÔNG để cổng webhook public không TLS — proxy qua Cloudflare Tunnel / ngrok / Caddy với HTTPS.
-- Nếu host trong nhà, cấu hình SMS forwarder app gửi qua Cloudflare Tunnel public URL.
-- Match số tiền: code mặc định cho phép khách trả **bằng hoặc nhiều hơn** số order. Nếu cần khớp tuyệt đối, sửa điều kiện trong `app/services/matcher.py`.
+## Mở rộng / thay nguồn dữ liệu
 
-## Mở rộng: thay nguồn dữ liệu
+Đã thiết kế `BankClient` interface (`app/services/banking/base.py`). Để chuyển sang Sepay/Casso/NH khác:
+1. Tạo class kế thừa `BankClient`, implement `fetch_incoming_transactions(since, until)`.
+2. Trỏ `app/worker.py` dùng client mới.
 
-Nếu sau này muốn chuyển sang Sepay/Casso (ổn định hơn parse SMS), chỉ cần thêm 1 router webhook mới (vd `app/api/sepay_webhook.py`) gọi cùng hàm `find_and_match_order(...)`. Logic order/SSE giữ nguyên.
+Phần order/QR/SSE/matching giữ nguyên.
+
+## Troubleshooting
+
+- **`test-login` báo 502 `MB login/fetch failed`**:
+  - Sai username/password → check lại bằng cách đăng nhập app MB Bank thường.
+  - MB tạm khoá vì login nhiều lần fail / nghi automation → đợi 1-2h, thử lại từ IP khác.
+  - Captcha OCR fail → thử restart container, lib sẽ retry.
+- **Worker không match được giao dịch dù tiền đã vào**:
+  - Check log `docker compose logs worker` xem có "Ingested tx" không. Nếu có nhưng không match → so sánh `description` log với `order_code`: format `description` MB trả khác mong đợi → cần điều chỉnh `app/services/matcher.py:normalize`.
+- **Order chưa kịp `paid` thì khách đã đóng web** — không sao, web bán hàng chỉ cần poll `/api/orders/{code}` lại lúc khách quay lại; trạng thái lưu trên DB.
+- **Muốn match số tiền tuyệt đối** (không cho trả dư): sửa điều kiện ở `app/services/matcher.py:46` từ `>=` thành `==`.
+
+## License
+
+Code này MIT. Lib `mbbank-lib` (https://github.com/thedtvn/MBBank) là MIT của tác giả The DT, không endorsed bởi MB Bank.
